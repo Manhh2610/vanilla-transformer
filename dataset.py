@@ -1,10 +1,10 @@
 import torch
 from torch.utils.data import Dataset
-from torchtext.vocab import build_vocab_from_iterator
-from torchtext.datasets import Multi30k
 from torch.nn.utils.rnn import pad_sequence
 from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
 from typing import Literal
+import os
 
 
 class Multi30kDe2En(Dataset):
@@ -12,51 +12,111 @@ class Multi30kDe2En(Dataset):
     SPECIAL_SYMBOLS = ['<unk>', '<pad>', '<bos>', '<eos>']
 
     def __init__(self, split: Literal['train', 'valid']):
-        super(Multi30kDe2En, self).__init__()
-        self.split = split
-        self.iter = Multi30k(split=split, language_pair=('de', 'en'))
-        self.de_texts, self.en_texts = list(zip(*self.iter))
+        super().__init__()
+
+        assert split in ['train', 'valid']
+        split_map = {
+            'train': 'train',
+            'valid': 'val'
+        }
+
+        base_path = os.path.join(
+            'data', 'multi30k', 'data', 'task1', 'raw'
+        )
+
+        de_path = os.path.join(base_path, f"{split_map[split]}.de")
+        en_path = os.path.join(base_path, f"{split_map[split]}.en")
+
+        with open(de_path, encoding='utf-8') as f:
+            self.de_texts = f.read().splitlines()
+
+        with open(en_path, encoding='utf-8') as f:
+            self.en_texts = f.read().splitlines()
+
+        assert len(self.de_texts) == len(self.en_texts)
+
         self.de_tokenizer = get_tokenizer('spacy', language='de_core_news_sm')
         self.en_tokenizer = get_tokenizer('spacy', language='en_core_web_sm')
-        self.de_vocab, self.en_vocab = self._load_vocabs()
+
+        # vocab chỉ build từ train
+        if split == 'train':
+            self.de_vocab, self.en_vocab = self._build_vocab()
+        else:
+            vocab_data = torch.load('vocab.pt')
+            self.de_vocab = vocab_data['de']
+            self.en_vocab = vocab_data['en']
 
     def __len__(self):
-        return len(self.en_texts)
+        return len(self.de_texts)
 
-    def __getitem__(self, index):
-        de_text = self.de_texts[index]
-        en_text = self.en_texts[index]
-        de_tensor = torch.tensor([self.de_vocab[token] for token in self.de_tokenizer(de_text)], dtype=torch.long)
-        en_tensor = torch.tensor([self.en_vocab[token] for token in self.en_tokenizer(en_text)], dtype=torch.long)
-        return de_tensor, en_tensor
+    def __getitem__(self, idx):
+        de_tokens = self.de_tokenizer(self.de_texts[idx])
+        en_tokens = self.en_tokenizer(self.en_texts[idx])
 
-    def _load_vocabs(self):
-        data_iter = Multi30k(split='train', language_pair=('de', 'en'))  # vocabs must be extracted from train split
-        de_texts, en_texts = list(zip(*data_iter))
-        de_tokens = [self.de_tokenizer(text.rstrip('\n')) for text in de_texts]
-        en_tokens = [self.en_tokenizer(text.rstrip('\n')) for text in en_texts]
-        de_vocab = build_vocab_from_iterator(iter(de_tokens), specials=self.SPECIAL_SYMBOLS)
-        en_vocab = build_vocab_from_iterator(iter(en_tokens), specials=self.SPECIAL_SYMBOLS)
+        de_ids = torch.tensor(
+            [self.de_vocab[token] for token in de_tokens],
+            dtype=torch.long
+        )
+
+        en_ids = torch.tensor(
+            [self.en_vocab[token] for token in en_tokens],
+            dtype=torch.long
+        )
+
+        return de_ids, en_ids
+
+    def _build_vocab(self):
+        de_tokens = (self.de_tokenizer(s) for s in self.de_texts)
+        en_tokens = (self.en_tokenizer(s) for s in self.en_texts)
+
+        de_vocab = build_vocab_from_iterator(
+            de_tokens,
+            specials=self.SPECIAL_SYMBOLS
+        )
+        en_vocab = build_vocab_from_iterator(
+            en_tokens,
+            specials=self.SPECIAL_SYMBOLS
+        )
+
         de_vocab.set_default_index(self.UNK_IDX)
         en_vocab.set_default_index(self.UNK_IDX)
+
+        torch.save(
+            {'de': de_vocab, 'en': en_vocab},
+            'vocab.pt'
+        )
 
         return de_vocab, en_vocab
 
     @classmethod
     def collate_fn(cls, batch):
         de_batch, en_batch = [], []
+
         for de, en in batch:
-            de_batch.append(torch.cat([torch.tensor([cls.BOS_IDX]), de, torch.tensor([cls.EOS_IDX])], dim=0))
-            en_batch.append(torch.cat([torch.tensor([cls.BOS_IDX]), en, torch.tensor([cls.EOS_IDX])], dim=0))
-        de_batch = pad_sequence(de_batch, padding_value=cls.PAD_IDX).permute(1, 0)
-        en_batch = pad_sequence(en_batch, padding_value=cls.PAD_IDX).permute(1, 0)
+            de = torch.cat([
+                torch.tensor([cls.BOS_IDX]),
+                de,
+                torch.tensor([cls.EOS_IDX])
+            ])
+            en = torch.cat([
+                torch.tensor([cls.BOS_IDX]),
+                en,
+                torch.tensor([cls.EOS_IDX])
+            ])
+
+            de_batch.append(de)
+            en_batch.append(en)
+
+        de_batch = pad_sequence(
+            de_batch,
+            padding_value=cls.PAD_IDX,
+            batch_first=True
+        )
+
+        en_batch = pad_sequence(
+            en_batch,
+            padding_value=cls.PAD_IDX,
+            batch_first=True
+        )
+
         return de_batch, en_batch
-
-
-if __name__ == '__main__':
-    from torch.utils.data import DataLoader
-
-    dataset = Multi30kDe2En('train')
-    dataloader = DataLoader(dataset, batch_size=16, collate_fn=Multi30kDe2En.collate_fn)
-    de, en = next(iter(dataloader))
-    print('done')
